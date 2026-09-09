@@ -5,11 +5,12 @@
 import json
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ParseMode
+from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -19,6 +20,7 @@ from telegram.ext import (
     filters,
 )
 
+import ai
 import db
 from jobs import check_no_shows
 
@@ -94,6 +96,95 @@ def cart_total(cart):
     return sum(x["price"] for x in cart)
 
 
+# --- разбор времени, написанного словами ------------------------------------
+# Гость не обязан попадать в кнопки: «через 7 минут», «минут через 20», «в 14:30»,
+# «уже иду», «10» — всё это должно превращаться в число минут.
+MIN_WAIT_MIN = 1
+MAX_WAIT_MIN = 180  # дальше трёх часов заказ смысла не имеет — это кофе навынос
+
+_NUM_WORDS = {
+    "один": 1, "одну": 1, "одна": 1, "полторы": 1,
+    "два": 2, "две": 2, "дві": 2, "пара": 2, "пару": 2,
+    "три": 3, "четыре": 4, "чотири": 4,
+    "пять": 5, "п'ять": 5, "шесть": 6, "шість": 6,
+    "семь": 7, "сім": 7, "восемь": 8, "вісім": 8,
+    "девять": 9, "дев'ять": 9, "десять": 10,
+    "одиннадцать": 11, "двенадцать": 12, "тринадцать": 13, "четырнадцать": 14,
+    "пятнадцать": 15, "п'ятнадцять": 15, "шестнадцать": 16, "семнадцать": 17,
+    "восемнадцать": 18, "девятнадцать": 19,
+    "двадцать": 20, "двадцять": 20, "тридцать": 30, "тридцять": 30,
+    "сорок": 40, "пятьдесят": 50,
+}
+# \b важен: без него «иду» находится внутри «приду завтра»
+_RE_SOON = re.compile(r"\b(?:сейчас|щас|зараз|сразу|иду|бегу|рядом|подхожу)\b")
+_RE_CLOCK = re.compile(r"\b([01]?\d|2[0-3])[:.\-]([0-5]\d)\b")
+_RE_HOURS = re.compile(r"\b(\d{1,2})\s*(?:час|годин)")
+_RE_MINS = re.compile(r"\b(\d{1,3})\s*(?:мин|min|хв)")
+_RE_MINS_REV = re.compile(r"(?:мин|хв)\w*\s+(\d{1,3})\b")  # «минут через 10», «через хвилин 10»
+_RE_AFTER = re.compile(r"через\s+(\d{1,3})\b")
+_RE_HOUR_WORD = re.compile(r"\bчас(?:а|ов|ик)?\b|\bгодин")
+
+
+def parse_minutes(text, now_local):
+    """Текст гостя -> сколько минут ждать. None, если это вообще не про время."""
+    t = (text or "").lower().replace("ё", "е").replace("’", "'").strip()
+    if not t or len(t) > 140:
+        return None
+
+    def ok(n):
+        return int(n) if MIN_WAIT_MIN <= n <= MAX_WAIT_MIN else None
+
+    # «10» одним числом — самый частый быстрый ответ
+    if re.fullmatch(r"\d{1,3}", t):
+        return ok(int(t))
+
+    # абсолютное время: «в 14:30», «к 9.05», «буду 18-40»
+    m = _RE_CLOCK.search(t)
+    if m:
+        target = now_local.replace(hour=int(m.group(1)), minute=int(m.group(2)),
+                                   second=0, microsecond=0)
+        delta = (target - now_local).total_seconds()
+        return ok(max(1, round(delta / 60))) if delta > 0 else None
+
+    if "завтра" in t or "вечером" in t:
+        return None  # заказы на потом не поддерживаем — пусть ответит консультант
+    if _RE_SOON.search(t):
+        return 5  # «уже иду» — всё равно нужно время на приготовление
+    if "полчаса" in t or "півгодини" in t:
+        return 30
+    if "полтора часа" in t or "півтори години" in t:
+        return 90
+
+    # цифрами
+    m = _RE_HOURS.search(t)
+    if m:
+        return ok(int(m.group(1)) * 60)
+    m = _RE_MINS.search(t) or _RE_MINS_REV.search(t) or _RE_AFTER.search(t)
+    if m:
+        return ok(int(m.group(1)))
+
+    # словами: «через три минуты», «минут через пятнадцать», «через час»
+    words = re.findall(r"[а-яa-zіїєґ']+", t)
+    n = None
+    for i, w in enumerate(words):
+        if w in _NUM_WORDS:
+            n = _NUM_WORDS[w]
+            # «двадцать пять» — десятки плюс единицы
+            if n >= 20 and i + 1 < len(words) and _NUM_WORDS.get(words[i + 1], 99) < 10:
+                n += _NUM_WORDS[words[i + 1]]
+            break
+    has_hour = bool(_RE_HOUR_WORD.search(t))
+    has_min = any(w.startswith(("мин", "хв")) for w in words)
+    if n is None:
+        return 60 if has_hour else None  # «через час» без числительного
+    if has_hour:
+        return ok(n * 60)
+    # голое числительное принимаем только в коротком ответе — «десять», «минут пятнадцать»
+    if not has_min and "через" not in t and len(words) > 3:
+        return None
+    return ok(n)
+
+
 async def notify_owner(context, text):
     if not OWNER_CHAT_ID:
         return
@@ -116,6 +207,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         who = f" · @{u.username}" if u.username else ""
         await notify_owner(context, f"🆕 Новый гость. Источник: {source}{who}")
     context.user_data.pop("cart", None)
+    context.user_data.pop("awaiting_time", None)
     # баннер-приветствие: шлём один раз при /start, если файл лежит в репозитории
     banner = CFG.get("banner")
     if banner and os.path.exists(banner):
@@ -142,6 +234,8 @@ async def show_main(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=Fal
     rows.append([InlineKeyboardButton("📍 Где мы · часы работы", callback_data="where")])
     kb = InlineKeyboardMarkup(rows)
     text = CFG.get("greeting", CFG.get("name", "Кофейня"))
+    if ai.ENABLED:  # подсказываем, что можно просто писать в чат
+        text += "\n\n💬 Есть вопрос — напишите прямо сюда, отвечу."
     if edit and update.callback_query:
         await update.callback_query.edit_message_text(text, reply_markup=kb)
     else:
@@ -150,6 +244,7 @@ async def show_main(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=Fal
 
 async def cb_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
+    context.user_data.pop("awaiting_time", None)
     await show_main(update, context, edit=True)
 
 
@@ -177,6 +272,8 @@ async def cb_where(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cb_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    # вышли из «когда заберёте» — числа в тексте больше не считаем временем
+    context.user_data.pop("awaiting_time", None)
     rows = [[InlineKeyboardButton(cat["title"], callback_data=f"c:{cat['id']}")]
             for cat in CFG["menu"]]
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="main")])
@@ -277,8 +374,12 @@ def time_keyboard():
         [InlineKeyboardButton("через 5 мин", callback_data="t:5"),
          InlineKeyboardButton("через 10 мин", callback_data="t:10")],
         [InlineKeyboardButton("через 15 мин", callback_data="t:15"),
-         InlineKeyboardButton("через 20 мин", callback_data="t:20")],
+         InlineKeyboardButton("через 30 мин", callback_data="t:30")],
     ])
+
+
+# Подсказка про свободный ввод: кнопки покрывают 90% случаев, остальные — текстом.
+TIME_HINT = "Когда заберёте?\n\nИли напишите своими словами: «через 7 минут», «в 14:30»"
 
 
 async def cb_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -287,7 +388,8 @@ async def cb_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("Корзина пуста", show_alert=True)
         return
     await q.answer()
-    await q.edit_message_text("Когда заберёте?", reply_markup=time_keyboard())
+    context.user_data["awaiting_time"] = True
+    await q.edit_message_text(TIME_HINT, reply_markup=time_keyboard())
 
 
 async def cb_repeat(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -298,12 +400,29 @@ async def cb_repeat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await q.answer()
     context.user_data["cart"] = [dict(x) for x in last]  # копия позиций последнего заказа
+    context.user_data["awaiting_time"] = True
     total = cart_total(context.user_data["cart"])
     lines = "\n".join(f"• {line_label(x)} — {x['price']} {CUR}" for x in context.user_data["cart"])
     await q.edit_message_text(
-        f"Повторяем заказ:\n{lines}\n\nИтого {total} {CUR}\nКогда заберёте?",
+        f"Повторяем заказ:\n{lines}\n\nИтого {total} {CUR}\n{TIME_HINT}",
         reply_markup=time_keyboard(),
     )
+
+
+def confirm_screen(context, mins):
+    """Экран подтверждения. Общий для кнопок и для времени, написанного текстом."""
+    ready = datetime.now(timezone.utc) + timedelta(minutes=mins)
+    context.user_data["ready_at"] = ready.isoformat()
+    cart = context.user_data["cart"]
+    total = cart_total(cart)
+    lines = "\n".join(f"• {line_label(x)} — {x['price']} {CUR}" for x in cart)
+    text = (f"{lines}\n\nИтого: {total} {CUR}\n"
+            f"🕗 К {hhmm(ready)} · оплата на кассе при получении")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Подтвердить", callback_data="ok")],
+        [InlineKeyboardButton("⬅️ Другое время", callback_data="co")],
+    ])
+    return text, kb
 
 
 async def cb_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -312,19 +431,8 @@ async def cb_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("cart"):
         await q.edit_message_text("Корзина пуста. Начните заново: /start")
         return
-    mins = int(q.data.split(":")[1])
-    ready = datetime.now(timezone.utc) + timedelta(minutes=mins)
-    context.user_data["ready_at"] = ready.isoformat()
-    cart = context.user_data["cart"]
-    total = cart_total(cart)
-    lines = "\n".join(f"• {line_label(x)} — {x['price']} {CUR}" for x in cart)
-    text = (f"{lines}\n\nИтого: {total} {CUR}\n"
-            f"🕗 К {hhmm(ready)} · оплата на кассе при получении")
-    rows = [
-        [InlineKeyboardButton("✅ Подтвердить", callback_data="ok")],
-        [InlineKeyboardButton("⬅️ Другое время", callback_data="co")],
-    ]
-    await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(rows))
+    text, kb = confirm_screen(context, int(q.data.split(":")[1]))
+    await q.edit_message_text(text, reply_markup=kb)
 
 
 async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -343,6 +451,7 @@ async def cb_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # чистим корзину
     context.user_data.pop("cart", None)
     context.user_data.pop("ready_at", None)
+    context.user_data.pop("awaiting_time", None)
     await q.edit_message_text(
         f"Готово! Заказ №{oid}, к {hhmm(ready)} 🕗\n"
         f"Подходите к кассе — оплата при получении. До встречи ☕"
@@ -435,7 +544,46 @@ async def cb_noshow(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # любой текст возвращает на главный экран — не заставляем искать кнопки
+    """Свободный текст: сначала пробуем прочитать в нём время, потом отвечает ИИ."""
+    text = (update.message.text or "").strip()
+    uid = update.effective_user.id
+    waiting = bool(context.user_data.get("awaiting_time") and context.user_data.get("cart"))
+
+    # 1) гость называет время своими словами вместо кнопки
+    if waiting:
+        mins = parse_minutes(text, datetime.now(TZ))
+        if mins:
+            body, kb = confirm_screen(context, mins)
+            await update.message.reply_text(body, reply_markup=kb)
+            return
+
+    # 2) всё остальное — вопрос консультанту
+    if ai.ENABLED:
+        if not ai.limit_ok(uid):
+            await update.message.reply_text(
+                "На сегодня вопросов достаточно 🙂 Загляните завтра, "
+                "а заказ можно оформить прямо сейчас — «📋 Меню».")
+            return
+        answer = ""
+        try:
+            await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+            answer = await ai.ask(text, CFG)
+            ai.record(uid)
+        except Exception as e:  # ИИ упал — гость не должен этого заметить
+            logger.warning("Консультант не ответил: %s", e)
+        if answer:
+            if waiting:  # не теряем незаконченный заказ
+                answer += f"\n\n{TIME_HINT}"
+                kb = time_keyboard()
+            else:
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📋 Меню", callback_data="menu")],
+                    [InlineKeyboardButton("⬅️ Главный экран", callback_data="main")],
+                ])
+            await update.message.reply_text(answer, reply_markup=kb)
+            return
+
+    # 3) ИИ выключен или не ответил — показываем кнопки, чтобы не оставлять в тупике
     await show_main(update, context)
 
 
@@ -470,7 +618,8 @@ def main():
     # фоновая проверка неявок раз в минуту
     app.job_queue.run_repeating(check_no_shows, interval=60, first=15)
 
-    logger.info("Кофейный бот «%s» запущен", CFG.get("name"))
+    logger.info("Кофейный бот «%s» запущен. Консультант: %s",
+                CFG.get("name"), "включён" if ai.ENABLED else "выключен (нет AI_API_KEY)")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
