@@ -116,6 +116,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         who = f" · @{u.username}" if u.username else ""
         await notify_owner(context, f"🆕 Новый гость. Источник: {source}{who}")
     context.user_data.pop("cart", None)
+    # баннер-приветствие: шлём один раз при /start, если файл лежит в репозитории
+    banner = CFG.get("banner")
+    if banner and os.path.exists(banner):
+        try:
+            with open(banner, "rb") as _b:
+                await context.bot.send_photo(update.effective_chat.id, _b)
+        except Exception as e:
+            logger.warning("Баннер не отправился: %s", e)
     await show_main(update, context)
 
 
